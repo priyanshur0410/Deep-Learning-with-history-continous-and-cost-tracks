@@ -2,18 +2,35 @@
 
 A Django-based backend system that wraps the `open_deep_research` agent to provide persistent research history, continuation capabilities, file-based context injection, reasoning visibility, LangSmith tracing, and token/cost tracking.
 
-## Architecture
+## Architecture & Design Decisions
 
 ### Overview
 
-The system is built with a clean separation of concerns:
+The system is built with a clean separation of concerns following Django best practices:
 
-- **Django + DRF**: RESTful API layer
-- **PostgreSQL**: Persistent data storage
-- **Celery**: Asynchronous task execution
+- **Django + DRF**: RESTful API layer providing standardized endpoints
+- **PostgreSQL**: Persistent data storage for research sessions, costs, and documents
+- **Celery**: Asynchronous task execution for non-blocking research operations
 - **LangChain + LangGraph**: Integration with the deep research agent
-- **LangSmith**: Tracing and monitoring
+- **LangSmith**: Tracing and monitoring for debugging and observability
 - **Adapter Pattern**: Wraps `open_deep_research` without modifying core logic
+
+### Design Principles
+
+1. **Non-Invasive Integration**: The adapter pattern ensures we never modify the core `open_deep_research` agent, maintaining compatibility with upstream updates.
+
+2. **Separation of Concerns**: 
+   - Models handle data persistence
+   - Views handle HTTP requests/responses
+   - Tasks handle async execution
+   - Adapter handles external integration
+   - Processors handle document operations
+
+3. **Async-First**: All long-running operations (research execution, document processing) are handled asynchronously via Celery to keep the API responsive.
+
+4. **Observability**: Built-in tracing (LangSmith) and cost tracking for monitoring and debugging.
+
+5. **Extensibility**: Clean interfaces allow easy addition of new features (file types, models, etc.) without major refactoring.
 
 ### Project Structure
 
@@ -193,20 +210,69 @@ celery -A creston worker --loglevel=info
 celery -A creston beat --loglevel=info
 ```
 
-## Research Continuation Strategy
+## Research Continuation Implementation
 
-When continuing a research session:
+### How It Works
 
-1. **Parent Linking**: New `ResearchSession` is created with `parent` FK pointing to the original
-2. **Context Injection**: Parent research summary is injected into the enhanced query
-3. **Explicit Instruction**: Agent is instructed to avoid repeating already-covered topics
-4. **Lineage Preservation**: Parent-child relationship is maintained for tracking
+Research continuation allows building upon previous research sessions without repetition. Here's how it's implemented:
 
-The adapter builds an enhanced query that includes:
-- Original query
-- Previous research summary
-- Instruction to avoid repetition
-- Document summaries (if any)
+#### 1. **Parent-Child Relationship**
+```python
+# In ResearchSession model
+parent = models.ForeignKey('self', on_delete=models.SET_NULL, 
+                          null=True, blank=True, related_name='continuations')
+```
+- Each continuation creates a new `ResearchSession` with a foreign key to the parent
+- This maintains a clear lineage: `parent → child → grandchild`
+- The relationship is preserved even if parent is deleted (`SET_NULL`)
+
+#### 2. **Context Injection Process**
+
+When `POST /api/research/{id}/continue` is called:
+
+1. **Extract Parent Summary**: 
+   ```python
+   parent_summary = parent_session.summary
+   if not parent_summary and parent_session.research_summary:
+       parent_summary = parent_session.research_summary.content
+   ```
+
+2. **Build Enhanced Query** (in `DeepResearchAdapter._build_context()`):
+   ```python
+   context_parts = [query]  # New query
+   
+   if parent_summary:
+       context_parts.append(
+           f"\n\nPrevious Research Summary:\n{parent_summary}\n\n"
+           "IMPORTANT: Do not repeat information already covered in the previous research. "
+           "Focus on new aspects, deeper analysis, or different angles of the topic."
+       )
+   ```
+
+3. **Inject Document Summaries**: If documents were uploaded to the parent session, their summaries are also included.
+
+#### 3. **Explicit Avoidance Instructions**
+
+The adapter explicitly instructs the agent to:
+- Not repeat already-covered topics
+- Focus on new aspects
+- Provide deeper analysis
+- Explore different angles
+
+This is done through prompt engineering in the enhanced query, ensuring the agent understands the continuation context.
+
+#### 4. **Implementation Location**
+
+- **API Endpoint**: `research/views.py` → `continue_research()` method
+- **Context Building**: `core/research_adapter.py` → `_build_context()` method
+- **Task Execution**: `research/tasks.py` → `execute_research()` task
+
+#### 5. **Benefits**
+
+- **No Redundancy**: Agent avoids repeating previous findings
+- **Progressive Depth**: Each continuation builds on previous knowledge
+- **Traceable Lineage**: Full history of research evolution
+- **Context Preservation**: All relevant context automatically included
 
 ## File Upload & Context Injection
 
@@ -227,104 +293,477 @@ Document summaries are automatically injected into research context when:
 - A research session is continued
 - Documents were uploaded to the session
 
-## LangSmith Integration
+## LangSmith Tracing Implementation
 
-### Configuration
-Set environment variables:
-```bash
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=your_langsmith_api_key
-LANGCHAIN_PROJECT=deep-research
-LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
+### How Tracing Works
+
+#### 1. **Decorator-Based Tracing**
+
+Every research execution is automatically traced using LangSmith's `@traceable` decorator:
+
+```python
+# In core/research_adapter.py
+@traceable(name="deep_research")
+def run_research(self, query: str, parent_summary: str = None, ...):
+    # Research execution code
 ```
 
-### Tracing
-- Every research run is traced using `@traceable` decorator
-- Trace ID is captured and stored in `ResearchSession.trace_id`
-- Trace ID is returned in API responses for debugging
+**What this does:**
+- Automatically creates a trace in LangSmith for each research run
+- Captures all LLM calls, tool invocations, and intermediate steps
+- Provides full visibility into the agent's decision-making process
+- Enables debugging and performance analysis
 
-### Viewing Traces
-1. Go to LangSmith dashboard
-2. Filter by project: `deep-research`
-3. Use trace_id from API response to find specific runs
+#### 2. **Trace ID Capture**
 
-## Cost & Token Tracking
+After research completes, the trace ID is captured and stored:
 
-### Token Tracking
-- Implemented via `TokenTrackingCallback` (LangChain callback)
-- Tracks input tokens, output tokens, and total tokens
-- Captures model name used
+```python
+# In core/research_adapter.py
+trace_id = os.getenv('LANGCHAIN_TRACE_ID', '')
+if not trace_id:
+    trace_id = str(uuid.uuid4())  # Fallback if not available
 
-### Cost Calculation
-- Model pricing is configurable in `settings.py` (`MODEL_PRICING`)
-- Costs calculated as:
-  ```
-  cost = (input_tokens / 1M) * input_price + (output_tokens / 1M) * output_price
-  ```
-- Stored in `ResearchCost` model per session
+return {
+    'trace_id': trace_id,
+    # ... other results
+}
+```
 
-### Default Pricing (per 1M tokens)
-- `gpt-4-turbo-preview`: $10 input / $30 output
-- `gpt-4`: $30 input / $60 output
-- `gpt-3.5-turbo`: $0.50 input / $1.50 output
+**How it works:**
+- LangSmith sets `LANGCHAIN_TRACE_ID` environment variable during tracing
+- We capture this value and store it in the database
+- If not available, we generate a UUID as fallback
 
-## Installation & Setup
+#### 3. **Persistence**
+
+Trace IDs are stored in the `ResearchSession` model:
+
+```python
+# In research/tasks.py
+session.trace_id = result.get('trace_id', '')
+session.save()
+```
+
+This allows:
+- Linking database records to LangSmith traces
+- Quick access to traces from API responses
+- Historical trace lookup
+
+#### 4. **Configuration**
+
+Set these environment variables in your `.env` file:
+
+```bash
+LANGCHAIN_TRACING_V2=true                    # Enable tracing
+LANGCHAIN_API_KEY=your_langsmith_api_key     # Your LangSmith API key
+LANGCHAIN_PROJECT=deep-research              # Project name in LangSmith
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com  # LangSmith API endpoint
+```
+
+**Getting your API key:**
+1. Go to https://smith.langchain.com/
+2. Sign up or log in
+3. Navigate to Settings → API Keys
+4. Create a new API key
+5. Copy and add to `.env`
+
+#### 5. **Viewing Traces**
+
+**Method 1: Via LangSmith Dashboard**
+1. Go to https://smith.langchain.com/
+2. Select project: `deep-research`
+3. Browse traces or search by trace_id
+
+**Method 2: Via API Response**
+1. Get research details: `GET /api/research/{id}`
+2. Extract `trace_id` from response
+3. Search for it in LangSmith dashboard
+
+**Method 3: Direct Link**
+```
+https://smith.langchain.com/o/{org_id}/projects/{project_id}/traces/{trace_id}
+```
+
+#### 6. **What's Traced**
+
+The `@traceable` decorator automatically captures:
+- **LLM Calls**: All prompts and responses
+- **Tool Invocations**: Function calls made by the agent
+- **Intermediate Steps**: Decision points in the agent's workflow
+- **Timing**: Duration of each operation
+- **Errors**: Any exceptions or failures
+- **Metadata**: Custom tags and metadata
+
+#### 7. **Benefits**
+
+- **Debugging**: See exactly what the agent did and why
+- **Performance**: Identify bottlenecks and slow operations
+- **Cost Analysis**: Understand which operations consume most tokens
+- **Quality Assurance**: Review agent behavior for improvements
+- **Compliance**: Full audit trail of research operations
+
+#### 8. **Design Decisions**
+
+- **Automatic Tracing**: No manual instrumentation needed - decorator handles everything
+- **Non-Intrusive**: Tracing doesn't affect research execution performance
+- **Trace ID Storage**: Stored in database for easy correlation
+- **Optional**: System works without LangSmith (trace_id will be empty)
+
+## Cost & Token Tracking Implementation
+
+### How Token Tracking Works
+
+#### 1. **Callback Handler**
+
+Token tracking is implemented via a custom LangChain callback handler:
+
+```python
+# In core/research_adapter.py
+class TokenTrackingCallback(BaseCallbackHandler):
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.model_name = None
+    
+    def on_llm_end(self, response: LLMResult, **kwargs):
+        if response.llm_output:
+            token_usage = response.llm_output.get('token_usage', {})
+            self.input_tokens += token_usage.get('prompt_tokens', 0)
+            self.output_tokens += token_usage.get('completion_tokens', 0)
+```
+
+**How it works:**
+- LangChain automatically calls `on_llm_end()` after each LLM invocation
+- Token usage is extracted from the response metadata
+- Tokens are accumulated across all LLM calls in a research session
+- Model name is captured from the response
+
+#### 2. **Integration with Research Adapter**
+
+```python
+# In DeepResearchAdapter.run_research()
+self.token_callback = TokenTrackingCallback()
+result = run_deep_research(
+    query=enhanced_query,
+    llm=self.llm,
+    callbacks=[self.token_callback],  # Pass callback here
+    **kwargs
+)
+```
+
+The callback is passed to the research agent, which propagates it to all LLM calls.
+
+#### 3. **Cost Calculation**
+
+Costs are calculated in the Celery task after research completes:
+
+```python
+# In research/tasks.py
+token_usage = result.get('token_usage', {})
+model_name = token_usage.get('model_name', settings.DEFAULT_MODEL)
+input_tokens = token_usage.get('input_tokens', 0)
+output_tokens = token_usage.get('output_tokens', 0)
+
+# Get pricing from settings
+pricing = settings.MODEL_PRICING.get(model_name, {'input': 0, 'output': 0})
+
+# Calculate cost (per 1M tokens)
+cost = (
+    (input_tokens / 1_000_000) * pricing['input'] +
+    (output_tokens / 1_000_000) * pricing['output']
+)
+```
+
+#### 4. **Persistence**
+
+Costs are stored in the `ResearchCost` model:
+
+```python
+ResearchCost.objects.update_or_create(
+    session=session,
+    defaults={
+        'model_name': model_name,
+        'input_tokens': input_tokens,
+        'output_tokens': output_tokens,
+        'total_tokens': total_tokens,
+        'estimated_cost_usd': cost,
+    }
+)
+```
+
+#### 5. **Configuration**
+
+Model pricing is configurable in `creston/settings.py`:
+
+```python
+MODEL_PRICING = {
+    'gpt-4-turbo-preview': {'input': 10.0, 'output': 30.0},
+    'gpt-4': {'input': 30.0, 'output': 60.0},
+    'gpt-3.5-turbo': {'input': 0.5, 'output': 1.5},
+}
+```
+
+Prices are per 1 million tokens. Update these values to match current provider pricing.
+
+#### 6. **Accessing Cost Data**
+
+Costs are automatically included in research detail responses:
+
+```json
+{
+  "cost": {
+    "model_name": "gpt-4-turbo-preview",
+    "input_tokens": 5000,
+    "output_tokens": 2000,
+    "total_tokens": 7000,
+    "estimated_cost_usd": 0.11
+  }
+}
+```
+
+#### 7. **Design Decisions**
+
+- **Estimated Costs**: We calculate estimated costs based on published pricing. Actual costs may vary slightly.
+- **Per-Session Tracking**: Each research session has its own cost record for granular tracking.
+- **Configurable Pricing**: Easy to update as provider pricing changes.
+- **Automatic Calculation**: No manual intervention needed - costs are calculated and stored automatically.
+
+## Setup & Run Instructions
 
 ### Prerequisites
-- Python 3.11+
-- PostgreSQL
-- Redis (for Celery broker)
 
-### Installation
+Before starting, ensure you have:
 
-1. **Clone and install dependencies:**
+- **Python 3.11+**: Check with `python --version`
+- **PostgreSQL 12+**: Database server installed and running
+- **Redis** (optional): For Celery broker. Can use PostgreSQL instead (see below)
+- **OpenAI API Key**: Get from https://platform.openai.com/
+- **LangSmith API Key** (optional): Get from https://smith.langchain.com/
+
+### Step-by-Step Setup
+
+#### 1. Install Python Dependencies
+
 ```bash
+# Install all required packages
 pip install -r requirements.txt
-```
 
-2. **Install open_deep_research:**
-```bash
+# Install open_deep_research agent
 pip install git+https://github.com/langchain-ai/open_deep_research.git
 ```
 
-3. **Configure environment variables:**
-Create a `.env` file:
+**Note**: If `open_deep_research` installation fails, you may need to clone the repository manually and adjust import paths in `core/research_adapter.py`.
+
+#### 2. Set Up PostgreSQL Database
+
+**Option A: Using pgAdmin (GUI)**
+1. Open pgAdmin
+2. Connect to PostgreSQL server
+3. Right-click "Databases" → "Create" → "Database"
+4. Name: `creston`
+5. Click "Save"
+
+**Option B: Using Command Line**
 ```bash
-SECRET_KEY=your-secret-key
+# Connect to PostgreSQL
+psql -U postgres
+
+# Create database
+CREATE DATABASE creston;
+
+# Exit
+\q
+```
+
+**Note**: If `psql` command not found, add PostgreSQL bin directory to PATH or use pgAdmin.
+
+#### 3. Configure Environment Variables
+
+Create a `.env` file in the project root:
+
+```bash
+# Django Settings
+SECRET_KEY=your-secret-key-here  # Generate with: python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
 DEBUG=True
+ALLOWED_HOSTS=localhost,127.0.0.1
+
+# Database Configuration
 DB_NAME=creston
 DB_USER=postgres
-DB_PASSWORD=postgres
+DB_PASSWORD=your_postgres_password
 DB_HOST=localhost
 DB_PORT=5432
+
+# Celery Configuration
+# Option 1: Using Redis (recommended for production)
 CELERY_BROKER_URL=redis://localhost:6379/0
 CELERY_RESULT_BACKEND=redis://localhost:6379/0
-OPENAI_API_KEY=your-openai-api-key
-LANGCHAIN_API_KEY=your-langsmith-api-key
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_PROJECT=deep-research
+
+# Option 2: Using PostgreSQL (easier setup, no Redis needed)
+CELERY_BROKER_URL=db+postgresql://postgres:your_password@localhost:5432/creston
+CELERY_RESULT_BACKEND=db+postgresql://postgres:your_password@localhost:5432/creston
+# Note: If password contains @, use %40 instead (e.g., Alpha22@ becomes Alpha22%40)
+
+# OpenAI Configuration
+OPENAI_API_KEY=sk-your-openai-api-key-here
 DEFAULT_MODEL=gpt-4-turbo-preview
+
+# LangSmith Configuration (optional but recommended)
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=your-langsmith-api-key-here
+LANGCHAIN_PROJECT=deep-research
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
+
+# CORS (if needed for frontend)
+CORS_ALLOWED_ORIGINS=http://localhost:3000
 ```
 
-4. **Run migrations:**
+**Important**: Replace all placeholder values with your actual credentials!
+
+#### 4. Run Database Migrations
+
 ```bash
+# Create migration files (if needed)
+python manage.py makemigrations
+
+# Apply migrations to create tables
 python manage.py migrate
+
+# If using PostgreSQL for Celery, also run:
+python manage.py migrate django_celery_results
 ```
 
-5. **Create superuser (optional):**
+#### 5. Create Superuser (Optional)
+
+For Django admin access:
+
 ```bash
 python manage.py createsuperuser
 ```
 
-6. **Start development server:**
+Follow prompts to create admin user.
+
+#### 6. Verify Setup
+
+Test that everything is configured correctly:
+
+```bash
+# Check Django configuration
+python manage.py check
+
+# Test database connection
+python manage.py dbshell
+# Type \q to exit
+```
+
+### Running the Application
+
+You need **2 terminal windows** running simultaneously:
+
+#### Terminal 1: Django Development Server
+
 ```bash
 python manage.py runserver
 ```
 
-7. **Start Celery worker (in separate terminal):**
+You should see:
+```
+Starting development server at http://127.0.0.1:8000/
+```
+
+**Verify**: Open http://localhost:8000/api/research/history/ in browser (should return `[]`)
+
+#### Terminal 2: Celery Worker
+
+**If using Redis:**
 ```bash
 celery -A creston worker --loglevel=info
 ```
+
+**If using PostgreSQL (Windows):**
+```bash
+celery -A creston worker --loglevel=info --pool=solo
+```
+
+**If using PostgreSQL (Linux/Mac):**
+```bash
+celery -A creston worker --loglevel=info
+```
+
+You should see:
+```
+celery@hostname v5.3.4 (singularity)
+...
+[tasks]
+  . research.tasks.execute_research
+  . research.tasks.process_document
+```
+
+### Testing the API
+
+#### Start a Research Session
+
+```bash
+curl -X POST http://localhost:8000/api/research/start/ \
+  -H "Content-Type: application/json" \
+  -d "{\"query\": \"What are the latest developments in AI?\", \"user_id\": 1}"
+```
+
+**Response:**
+```json
+{
+  "session_id": 1,
+  "status": "pending",
+  "message": "Research session started"
+}
+```
+
+#### Check Research Status
+
+```bash
+curl http://localhost:8000/api/research/1/
+```
+
+#### Check Research History
+
+```bash
+curl http://localhost:8000/api/research/history/?user_id=1
+```
+
+### Troubleshooting
+
+**Database Connection Errors:**
+- Verify PostgreSQL is running: Check Services (Windows) or `systemctl status postgresql` (Linux)
+- Check password in `.env` matches PostgreSQL password
+- Ensure database `creston` exists
+
+**Celery Not Processing Tasks:**
+- Verify Celery worker is running (Terminal 2)
+- Check broker URL in `.env` is correct
+- If using Redis, ensure Redis is running: `redis-cli ping` (should return `PONG`)
+- Check Celery logs for errors
+
+**Import Errors:**
+- Ensure `open_deep_research` is installed: `pip list | grep open-deep-research`
+- May need to adjust import paths in `core/research_adapter.py` based on actual package structure
+
+**Research Stays in "pending" Status:**
+- Check Celery worker is running
+- Check Celery logs for errors
+- Verify `open_deep_research` is properly installed and importable
+
+### Production Deployment
+
+For production:
+1. Set `DEBUG=False` in `.env`
+2. Use a strong `SECRET_KEY`
+3. Configure proper `ALLOWED_HOSTS`
+4. Use a production WSGI server (Gunicorn/uWSGI)
+5. Set up proper Celery workers (systemd/supervisor)
+6. Use environment variables instead of `.env` file
+7. Set up reverse proxy (Nginx)
+8. Configure proper logging
 
 ## Integration with open_deep_research
 
@@ -388,5 +827,8 @@ If the `open_deep_research` API differs from expectations:
 
 [Contributing guidelines]
 
-#   - D e e p - R e s e a r c h - S y s t e m - w i t h - H i s t o r y - C o n t i n u a t i o n - C o s t - T r a c k i n g  
- 
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 15191a1 (Update README.md)
+#
